@@ -2,8 +2,37 @@ import argparse
 import requests
 import logging
 import re
+import sys
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
+
+SECRET_PATTERNS = [
+    re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9\-]{4,}\b", re.IGNORECASE),
+    re.compile(r"\b(?:ghp|gho|github_pat|sk|pk)_[A-Za-z0-9_\-]{8,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9_\-\.]{8,}", re.IGNORECASE),
+    re.compile(r"\b(api[_-]?key|secret|token|password|passwd|credential)s?\b\s*[:=]\s*\S+", re.IGNORECASE),
+]
+
+def redact_secrets(text):
+    """Replace secret shaped values with a redaction marker."""
+    redacted = text
+    for pattern in SECRET_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+def contains_secret_shape(text):
+    return any(pattern.search(text) for pattern in SECRET_PATTERNS)
+
+def severity_for(message):
+    """Rate a finding from its matched content."""
+    lowered = message.lower()
+    if contains_secret_shape(message) or "credential" in lowered or "api key" in lowered or "secret" in lowered:
+        return "Critical"
+    if any(word in lowered for word in ("database", "schema", "sql", "stack trace", "table ")):
+        return "High"
+    if any(word in lowered for word in ("exception", "debug", "version", "internal path")):
+        return "Medium"
+    return "Low"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -71,7 +100,7 @@ def is_valid_url(url):
         return False
 
 
-def crawl_website(url, max_depth, exclude, keywords, visited=None, depth=0):
+def crawl_website(url, max_depth, exclude, keywords, visited=None, depth=0, stats=None):
     """
     Crawls a website and analyzes error messages for sensitive information disclosure.
 
@@ -89,6 +118,8 @@ def crawl_website(url, max_depth, exclude, keywords, visited=None, depth=0):
 
     if visited is None:
         visited = set()
+    if stats is None:
+        stats = {"fetched": 0}
 
     if depth > max_depth or url in visited:
         return []
@@ -99,23 +130,26 @@ def crawl_website(url, max_depth, exclude, keywords, visited=None, depth=0):
     try:
         logging.info(f"Crawling: {url} (Depth: {depth})")
         response = requests.get(url, timeout=10)
-        # raise_for_status throws the actual error pages away. The 404 and 500 responses whose
-        # text this tool exists to read never reach the analyzer below.
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
+        # The body is analyzed before any status check: error responses
+        # are the primary targets, and their status code is recorded in
+        # each finding instead of the page being discarded.
+        stats["fetched"] += 1
+        status_code = response.status_code
 
         soup = BeautifulSoup(response.content, "html.parser")
 
         # Analyze error messages in the current page
         error_messages = analyze_error_messages(soup, keywords)
         for message in error_messages:
+            severity = severity_for(message)
+            safe_message = redact_secrets(message)
             vulnerabilities.append(
                 {
                     "url": url,
-                    "message": message,
-                    # Every finding takes this same severity, whatever its message says. A leaked secret
-                    # and the word warning sitting in a page footer carry the same weight in my report.
-                    "severity": "Medium", # Heuristic value, refine based on message content
-                    "description": f"Possible sensitive information disclosure in error message: {message}",
+                    "message": safe_message,
+                    "status_code": status_code,
+                    "severity": severity,
+                    "description": f"Possible sensitive information disclosure in error message: {safe_message}",
                 }
             )
 
@@ -127,10 +161,9 @@ def crawl_website(url, max_depth, exclude, keywords, visited=None, depth=0):
                 # Normalize the URL to prevent duplicates due to trailing slashes, etc.
                 absolute_url = absolute_url.rstrip("/")
 
-                # This same site test compares a full absolute URL against the starting netloc, and a
-                # full URL begins with its scheme, not its host, so the test is false for ordinary
-                # links. In practice I analyze the start page and follow nothing.
-                if is_valid_url(absolute_url) and absolute_url.startswith(urlparse(url).netloc):
+                # Same host test: compare the parsed netloc of the
+                # candidate against the parsed netloc of the base URL.
+                if is_valid_url(absolute_url) and urlparse(absolute_url).netloc == urlparse(url).netloc:
                     is_excluded = False
                     for pattern in exclude:
                         if pattern in absolute_url:
@@ -139,7 +172,7 @@ def crawl_website(url, max_depth, exclude, keywords, visited=None, depth=0):
 
                     if not is_excluded:
                         vulnerabilities.extend(
-                            crawl_website(absolute_url, max_depth, exclude, keywords, visited, depth + 1)
+                            crawl_website(absolute_url, max_depth, exclude, keywords, visited, depth + 1, stats)
                         )
 
 
@@ -180,26 +213,33 @@ def analyze_error_messages(soup, keywords):
     return error_messages
 
 
-def write_report(vulnerabilities, output_file):
+def write_report(vulnerabilities, output_file, status=None):
     """
     Writes a vulnerability report to a file.
 
     Args:
         vulnerabilities (list): A list of dictionaries representing the vulnerabilities.
         output_file (str): The path to the output file.
+        status (str): An explicit run status, for example a crawl failure,
+            written into the report instead of a clean result.
     """
     try:
         with open(output_file, "w") as f:
             f.write("Vulnerability Report\n")
             f.write("--------------------\n\n")
+            if status:
+                f.write(f"Status: {status}\n\n")
             if not vulnerabilities:
-                f.write("No vulnerabilities found.\n")
+                if not status:
+                    f.write("No vulnerabilities found.\n")
             else:
                 for vuln in vulnerabilities:
                     f.write(f"URL: {vuln['url']}\n")
+                    if "status_code" in vuln:
+                        f.write(f"Status Code: {vuln['status_code']}\n")
                     f.write(f"Severity: {vuln['severity']}\n")
-                    f.write(f"Description: {vuln['description']}\n")
-                    f.write(f"Error Message: {vuln['message']}\n")
+                    f.write(f"Description: {redact_secrets(vuln['description'])}\n")
+                    f.write(f"Error Message: {redact_secrets(vuln['message'])}\n")
                     f.write("\n")
         logging.info(f"Vulnerability report written to {output_file}")
     except IOError as e:
@@ -222,15 +262,24 @@ def main():
     # Input validation
     if not is_valid_url(url):
         print("Error: Invalid URL provided.")
-        return
+        write_report([], output_file, status="Crawl failed: invalid start URL.")
+        sys.exit(1)
 
     try:
-        vulnerabilities = crawl_website(url, max_depth, exclude, keywords)
+        stats = {"fetched": 0}
+        vulnerabilities = crawl_website(url, max_depth, exclude, keywords, stats=stats)
+        if stats["fetched"] == 0:
+            write_report(vulnerabilities, output_file, status="Crawl failed: no page could be fetched.")
+            print(f"Crawl failed: no page could be fetched.  Check {output_file} for the status.")
+            sys.exit(1)
         write_report(vulnerabilities, output_file)
         print(f"Analysis complete.  Check {output_file} for results.")
 
+    except SystemExit:
+        raise
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
