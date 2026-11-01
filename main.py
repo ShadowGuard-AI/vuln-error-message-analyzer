@@ -99,6 +99,8 @@ def crawl_website(url, max_depth, exclude, keywords, visited=None, depth=0):
     try:
         logging.info(f"Crawling: {url} (Depth: {depth})")
         response = requests.get(url, timeout=10)
+        # raise_for_status throws the actual error pages away. The 404 and 500 responses whose
+        # text this tool exists to read never reach the analyzer below.
         response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
 
         soup = BeautifulSoup(response.content, "html.parser")
@@ -110,6 +112,8 @@ def crawl_website(url, max_depth, exclude, keywords, visited=None, depth=0):
                 {
                     "url": url,
                     "message": message,
+                    # Every finding takes this same severity, whatever its message says. A leaked secret
+                    # and the word warning sitting in a page footer carry the same weight in my report.
                     "severity": "Medium", # Heuristic value, refine based on message content
                     "description": f"Possible sensitive information disclosure in error message: {message}",
                 }
@@ -123,6 +127,9 @@ def crawl_website(url, max_depth, exclude, keywords, visited=None, depth=0):
                 # Normalize the URL to prevent duplicates due to trailing slashes, etc.
                 absolute_url = absolute_url.rstrip("/")
 
+                # This same site test compares a full absolute URL against the starting netloc, and a
+                # full URL begins with its scheme, not its host, so the test is false for ordinary
+                # links. In practice I analyze the start page and follow nothing.
                 if is_valid_url(absolute_url) and absolute_url.startswith(urlparse(url).netloc):
                     is_excluded = False
                     for pattern in exclude:
@@ -155,10 +162,16 @@ def analyze_error_messages(soup, keywords):
         list: A list of error messages containing the keywords.
     """
     error_messages = []
+    # get_text pulls in navigation, script, and style text along with the page body, and the
+    # default keyword list includes path and version, words ordinary documentation uses
+    # constantly. Most of what I report on a normal site is prose, not an error message.
     text_content = soup.get_text().lower() # Convert to lowercase for case-insensitive search
     for keyword in keywords:
         if keyword.lower() in text_content: #Case insensitive check
             # Very basic implementation.  Consider improving with regex and context extraction.
+            # The keyword enters the pattern exactly as typed, so one carrying regex characters changes
+            # the pattern's meaning. A message also only counts when sentence punctuation ends it,
+            # which leaves a bare stack line or a short banner uncounted however relevant it is.
             matches = re.findall(r"[^.?!]*(?:" + keyword.lower() + r")[^.?!]*[.?!]", text_content)
             error_messages.extend(matches)
             #Remove duplicated messages, keeping order
