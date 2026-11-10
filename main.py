@@ -195,20 +195,36 @@ def analyze_error_messages(soup, keywords):
         list: A list of error messages containing the keywords.
     """
     error_messages = []
-    # get_text pulls in navigation, script, and style text along with the page body, and the
-    # default keyword list includes path and version, words ordinary documentation uses
-    # constantly. Most of what I report on a normal site is prose, not an error message.
-    text_content = soup.get_text().lower() # Convert to lowercase for case-insensitive search
+    # Drop script, style, and navigation blocks first, so their prose
+    # is not scanned as if it were page body error text.
+    try:
+        for tag in soup.find_all(["script", "style", "nav", "header", "footer", "aside"]):
+            tag.decompose()
+    except Exception:
+        pass
+    try:
+        text_content = soup.get_text(separator="\n")
+    except TypeError:
+        text_content = soup.get_text()
+    # Split into lines and sentences. A segment does not need terminal
+    # punctuation to count, so a bare stack trace line or a short
+    # banner is scanned as well as a full sentence.
+    segments = []
+    for chunk in re.split(r"(?<=[.?!])\s+|\n+", text_content):
+        chunk = chunk.strip()
+        if chunk:
+            segments.append(chunk)
     for keyword in keywords:
-        if keyword.lower() in text_content: #Case insensitive check
-            # Very basic implementation.  Consider improving with regex and context extraction.
-            # The keyword enters the pattern exactly as typed, so one carrying regex characters changes
-            # the pattern's meaning. A message also only counts when sentence punctuation ends it,
-            # which leaves a bare stack line or a short banner uncounted however relevant it is.
-            matches = re.findall(r"[^.?!]*(?:" + keyword.lower() + r")[^.?!]*[.?!]", text_content)
-            error_messages.extend(matches)
-            #Remove duplicated messages, keeping order
-            error_messages = list(dict.fromkeys(error_messages))
+        if not keyword or not keyword.strip():
+            continue
+        # The keyword is escaped, so regex characters in it are matched
+        # literally instead of changing the pattern or raising re.error.
+        pattern = re.compile(re.escape(keyword.strip()), re.IGNORECASE)
+        for segment in segments:
+            if pattern.search(segment):
+                error_messages.append(segment)
+        # Remove duplicated messages, keeping order
+        error_messages = list(dict.fromkeys(error_messages))
 
     return error_messages
 
